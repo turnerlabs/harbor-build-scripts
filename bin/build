@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+
+data_add() {
+    local url=$1
+    local content_type=$2
+    local data=$3
+
+    if [[ "${content_type}" == "tar" ]]; then
+        curl -sfv -X POST -H "Content-Type: application/${content_type}" --data-binary @${data} "${url}"
+    else
+        curl -sfv -X POST -H "Content-Type: application/${content_type}" --data-binary "${data}" "${url}"
+    fi
+}
+
+post_webhook() {
+    if [ -n "${WEBHOOK}" ]; then
+        local status=${1:-OK}
+        local err=''
+
+        if [ -n "$2" ]; then
+            err="\"error\": \"$2\", "
+        fi
+
+        data_add "${WEBHOOK}" "json" "{\"status\": \"${status}\", ${err}\"name\": \"${NAME}\", \"version\": \"${VERSION}\"}"
+    fi
+}
+
+error() {
+    post_webhook "ERROR" "$2"
+    >&2 echo "[ERROR] $1"
+    exit 1
+}
+
+# Remove state file if found
+state_file='.mss-docker-build-scripts.state'
+if [ -f "${state_file}" ]; then
+    rm "${state_file}"
+fi
+
+BUILD_TOOL_DIR=$(dirname "${BASH_SOURCE[0]}")
+
+source "${BUILD_TOOL_DIR}/../lib/common.sh"
+
+TARBALL=${TARBALL:-git}
+# Decode URL (needed because curl won't do it by default)
+TARBALL="$(printf "`printf "%s\n" "${TARBALL}" | sed -e 's/+/ /g' -e 's/%\(..\)/\\\\x\1/g'`")"
+
+if [ -n "$WEBHOOK" ]; then
+  # Decode webhook URL (needed because curl won't do it by default)
+  WEBHOOK="$(printf "`printf "%s\n" "${WEBHOOK}" | sed -e 's/+/ /g' -e 's/%\(..\)/\\\\x\1/g'`")"
+fi
+
+# ALLOW INSECURE
+ADD_INSECURE=${INSECURE:+--insecure}
+
+if [ "${TARBALL}" = "git" ]; then
+    # If tarball is git, use the last revision of git repo in root directory
+    TARBALL=tmp${RANDOM}.tar.gz
+    BRANCH=$(git rev-parse HEAD)
+    if [ -z "${BRANCH}" ]; then
+        error 'TARBALL=git but where I was run is not a git repo root'
+    fi
+    git archive --format=tar "${BRANCH}" | gzip -9 > "${TARBALL}"
+    echo '[INFO] Using tarball created from git repo for this directory'
+elif [[ "${TARBALL}" =~ ^https? ]]; then
+    # If tarball is an https? link, download tarball and use that
+    LINK="${TARBALL}"
+    TARBALL="tmp${RANDOM}.tar.gz"
+    HTTP_CODE=$(curl "${ADD_INSECURE}" -sL -w "%{http_code}" "${LINK}" -o ${TARBALL})
+    if [ "${HTTP_CODE}" -lt "200" ] || [ "${HTTP_CODE}" -ge "400" ]; then
+        error "http error code ${HTTP_CODE} for TARBALL=${LINK}"
+    fi
+    echo "[INFO] Using tarball downloaded from ${LINK}"
+else
+    # Otherwise, tarball is local file
+    if [ ! -f "${TARBALL}" ]; then
+        error "TARBALL=${TARBALL} but local file not found"
+    fi
+    echo "[INFO] Using local tarball located at ${TARBALL} (pwd is $(pwd))"
+fi
+
+has_dockerfile=$(tar tzf ${TARBALL} | egrep '^(./)?Dockerfile$')
+if [ -z "${has_dockerfile}" ]; then
+    error "No Dockerfile in root of tarball"
+fi
+
+TURNER_METADATA="$(tar tzf ${TARBALL} | egrep '^TURNER_METADATA$' > /dev/null && tar zxf ${TARBALL} -O TURNER_METADATA)"
+
+if [ -n "${TURNER_METADATA}" ]; then
+    echo '[INFO] The following was found in TURNER_METADATA (NOTE: Will not override anything already set)'
+    echo "${TURNER_METADATA}" | sed 's|^|  |g'
+    # Assign values from TURNER_METADATA only if they aren't already set
+    eval "$(echo "${TURNER_METADATA}" | sed 's|^\([^=]*\)=\(.*\)|\1=${\1:-\2}|')"
+fi
+
+if [ -z "${VERSION}" ]; then
+    # Version isn't set yet, let's try to get it
+    if [ -f package.json ]; then
+        VERSION=$(cat package.json | jq -r .version)
+        NAME=$(cat package.json | jq -r .name)
+    else
+        VERSION=$(grep -E "^#\s*VERSION:" Dockerfile  | cut -d ':' -f 2 | tr -d ' ')
+        NAME=$(grep -E "^#\s*NAME:" Dockerfile  | cut -d ':' -f 2 | tr -d ' ')
+    fi
+fi
+
+if [ -z "${NAME}" ]; then
+  error 'ENVVAR NAME is not set. NAME is needed to name docker image'
+elif [ -z "${VERSION}" ]; then
+  error 'ENVVAR VERSION is not set. VERSION is needed to name docker image'
+fi
+
+# If we have a PRE_RELEASE_LABEL set, append it to VERSION
+VERSION+=${PRE_RELEASE_LABEL:+-${PRE_RELEASE_LABEL}}
+
+# Need these for Docker Server
+DOCKER_PRODUCT=${DOCKER_PRODUCT:-mss-docker-build}
+DOCKER_ENVIRONMENT=${DOCKER_ENVIRONMENT:-staging}
+DOCKER_LOCATION=${DOCKER_LOCATION:-56m}
+# Get the Docker Server
+DOCKER=${DOCKER:-$( random_server "${DOCKER_PRODUCT}" "${DOCKER_ENVIRONMENT}" "${DOCKER_LOCATION}" )}
+if [ "${DOCKER}" = '' ]; then
+  error 'No Docker build server found. Either there are none running or IDB is misbehaving'
+fi
+
+CATALOGIT_URL=${CATALOGIT_URL:-${DEFAULT_CATALOGIT_URL}}
+REGISTRY_CATALOGIT=${REGISTRY:-${DEFAULT_REGISTRY_CATALOGIT}}
+REGISTRY=${REGISTRY:-${DEFAULT_REGISTRY}}
+
+# Display useful info
+echo "[INFO] The following config is being used for this build:
+  NAME:          ${NAME}
+  VERSION:       ${VERSION}
+  CATALOGIT_URL: ${CATALOGIT_URL}
+  DOCKER:        ${DOCKER}
+  REGISTRY:      ${REGISTRY}"
+if [ -n "${WEBHOOK}" ]; then
+  echo "  WEBHOOK:       ${WEBHOOK}"
+fi
+echo
+
+# Check CatalogIt to see if we already exist
+CHECK_CODE="$( curl -sL -w "%{http_code}" -o /dev/null "${CATALOGIT_URL}/v1/containers/${NAME}/${VERSION}" )"
+if [ "${CHECK_CODE}" != "404" ]; then
+    error "${CATALOGIT_URL}/containers/${NAME}/${VERSION} already exists. Images are immutable"
+fi
+
+# Upload tarball, build, and tag
+data_add "${DOCKER}/build?t=${REGISTRY}/${NAME}:${VERSION}&nocache=1" "tar" ${TARBALL}
+if [ "$?" != "0" ]; then
+    error "Docker build failed"
+fi
+
+# Push to registry
+data_add "${DOCKER}/images/${REGISTRY}/${NAME}/push?tag=${VERSION}" "json" '{}'
+if [ "$?" != '0' ]; then
+    error "Uploading image to registry failed"
+fi
+
+my_count=0
+while true; do
+    my_status=$( curl -so /dev/null -w "%{http_code}" "${REGISTRY}/v2/${NAME}/manifests/${VERSION}" )
+
+    if [[ "${my_status}" == "404" ]]; then
+        my_count=$(( my_count + 1))
+        sleep 10
+    elif [[ "${my_status}" == "200" ]]; then
+        echo "Container has been registered"
+        my_count=0
+        break
+    else
+        error "Container failed to register with status code ${my_status}"
+    fi
+
+    if [[ "${my_count}" == 60 ]]; then
+        error "Container failed to register due to timeout"
+    fi
+done
+
+# Delete image
+curl -s -X DELETE "${DOCKER}/images/${REGISTRY}/${NAME}:${VERSION}"
+
+# Delete tarball
+rm -f ${TARBALL}
+
+# Add image to CatalogIt
+if [ -z "${NO_CATALOGIT}" ]; then
+    data_add "${CATALOGIT_URL}/v1/containers" "json" "{\"name\":\"${NAME}\",\"version\":\"${VERSION}\",\"image\":\"${REGISTRY_CATALOGIT}/${NAME}:${VERSION}\"}"
+    if [ "$?" != '0' ]; then
+        error "Posting image to CatalogIt failed."
+    fi
+fi
+
+# If WEBHOOK set, post webhook
+if [ -n "${WEBHOOK}" ]; then
+    post_webhook "OK"
+fi
+
+# Save off a state file
+echo "NAME=${NAME}
+VERSION=${VERSION}" > "${state_file}"

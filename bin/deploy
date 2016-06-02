@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+
+main() {
+    local catalogit="${CATALOGIT_API:-http://catalogit.services.dmtio.net}"
+    local shipit="${SHIPIT_API:-http://shipit.services.dmtio.net}"
+    local trigger="${TRIGGER_URL:-http://harbor-trigger.services.dmtio.net}"
+
+    local container
+    local version
+    local shipment
+    local environment
+    local token
+
+    while getopts hc:v:s:e:t: opt; do
+        case "${opt}" in
+            h)
+                usage 0
+                ;;
+
+            c)
+                container="${OPTARG}"
+                ;;
+
+            v)
+                version="${OPTARG}"
+                ;;
+
+            s)
+                shipment="${OPTARG}"
+                ;;
+
+            e)
+                environment="${OPTARG}"
+                ;;
+
+            t)
+                token="${OPTARG}"
+                ;;
+
+            \?)
+                die "Invalid options: -${OPTARG}"
+                usage 1
+                ;;
+
+            :)
+                die "Option -${OPTARG} requires an argument"
+                usage 1
+                ;;
+        esac
+    done
+    shift $(( OPTIND - 1 ))
+
+    # If a build state file exists, source it
+    local state_file='.mss-docker-build-scripts.state'
+    if [ -f "${state_file}" ]; then
+        . "${state_file}"
+    fi
+
+    container="${container:-$NAME}"
+    version="${version:-$VERSION}"
+    shipment="${shipment:-$SHIPMENT}"
+    environment="${environment:-$ENVIRONMENT}"
+    token="${token:-$BUILD_TOKEN}"
+
+    require_values '$container' '$version' '$shipment' '$environment' '$token'
+
+    # Get the container image from CatalogIt
+    image=$(curl -s -H'Content-Type: application/json' "${catalogit}/v1/container/${container}/${version}" |cut -d ',' -f 3 |cut -d '"' -f 4)
+    if [[ "${image}" == "Container not found" ]]; then
+        die "${image} ${container} v${version}"
+    fi
+    info "Fetched image information for container ${container}/${version}: ${image}"
+
+    # Update ShipIt
+    status=$(curl -s -o /dev/null -X PUT -w "%{http_code}" -H'Content-Type: application/json' --data-binary "{\"image\": \"${image}\", \"buildToken\": \"${token}\"}" "${shipit}/v1/shipment/${shipment}/environment/${environment}/container/${container}")
+    if [ "${status}" -lt "200" ] || [ "${status}" -ge "400" ]; then
+        die "Image was not updated on Shipment, status code ${status}"
+    fi
+    info "Updated Shipment ${shipment}/${environment}"
+
+    curl -sSv -X POST "${trigger}/${shipment}/${environment}/ec2"
+    info "Triggered ${shipment}/${environment}/ec2"
+}
+
+usage() {
+  echo 'usage: deploy OPTIONS'
+  echo 'OPTIONS'
+  echo ' -h  This help message'
+  echo ' -c  The container name to deploy ($NAME)'
+  echo ' -v  The container version to deploy ($VERSION)'
+  echo ' -s  The shipment name to deploy ($SHIPMENT)'
+  echo ' -e  The environment to deploy ($ENVIRONMENT)'
+  echo ' -t  The ShipIt build token to use ($BUILD_TOKEN)'
+  exit "${1:-1}"
+}
+
+die() {
+    echo >&2 "ERROR: $1"
+    exit 1
+}
+
+info() {
+    echo "$0: $*"
+    echo
+}
+
+require_values() {
+    while (( $# )); do
+        eval "local value=$1"
+        if [ -z "${value}" ]; then
+            die "${REQUIRE_MESSAGE:-"missing dependency '$1'"}"
+        fi
+        shift
+    done
+}
+
+main "$@"
